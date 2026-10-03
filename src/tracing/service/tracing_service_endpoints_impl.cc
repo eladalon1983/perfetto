@@ -27,6 +27,7 @@
 #include "perfetto/ext/tracing/core/consumer.h"
 #include "perfetto/ext/tracing/core/producer.h"
 #include "perfetto/ext/tracing/core/trace_writer.h"
+#include "perfetto/tracing/core/data_source_config.h"
 #include "perfetto/tracing/core/tracing_service_capabilities.h"
 #include "perfetto/tracing/core/tracing_service_state.h"
 #include "src/tracing/core/in_process_shared_memory.h"
@@ -36,6 +37,7 @@
 #include "src/tracing/service/trace_buffer_v2.h"
 #include "src/tracing/service/tracing_service_impl.h"
 #include "src/tracing/service/tracing_service_structs.h"
+#include "src/tracing/v2/producer_ring_buffer_config.h"
 #include "src/tracing/v2/shared_ring_buffer_abi.h"
 
 #include "protos/perfetto/common/builtin_clock.pbzero.h"
@@ -782,33 +784,37 @@ bool ProducerEndpointImpl::IsAndroidProcessFrozen() {
   return false;
 }
 
-void ProducerEndpointImpl::InitializeV2RingBuffer() {
+void ProducerEndpointImpl::InitializeV2RingBuffer(
+    const DataSourceConfig& config) {
   PERFETTO_DCHECK_THREAD(thread_checker_);
   if (v2_ring_buffer_arbiter_.has_value() || !in_process_ ||
       !(protocol_abi_versions_ & kProtocolAbiV2)) {
     return;
   }
 
-  auto size = tracing_v2::RingBufferSizeForShmSizeHint(
-      shmem_size_hint_bytes_, TracingService::kMaxShmSize,
-      tracing_v2::kMinChunkSize);
-  if (!size) {
+  const auto ring_buffer_config = tracing_v2::ResolveProducerRingBufferConfig(
+      config, shmem_size_hint_bytes_, TracingService::kMaxShmSize);
+  if (!ring_buffer_config) {
     PERFETTO_ELOG("tracing v2: cannot size ring buffer for shmem size hint %zu",
                   shmem_size_hint_bytes_);
     v2_ring_buffer_arbiter_ = nullptr;
     return;
   }
 
-  auto memory = InProcessSharedMemory::Create(*size);
+  auto memory =
+      InProcessSharedMemory::Create(ring_buffer_config->shmem_size_bytes);
   if (!memory) {
-    PERFETTO_ELOG("tracing v2: failed to allocate %zu-byte ring buffer", *size);
+    PERFETTO_ELOG("tracing v2: failed to allocate %zu-byte ring buffer",
+                  ring_buffer_config->shmem_size_bytes);
     v2_ring_buffer_arbiter_ = nullptr;
     return;
   }
 
   v2_ring_buffer_arbiter_ =
       std::make_unique<tracing_v2::ProducerRingBufferArbiter>(
-          weak_runner_.task_runner(), this, std::move(memory));
+          weak_runner_.task_runner(), this, std::move(memory),
+          ring_buffer_config->chunk_size,
+          ring_buffer_config->drain_occupancy_threshold);
 }
 
 void ProducerEndpointImpl::AttachV2RingBuffer(
