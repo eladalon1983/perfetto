@@ -393,5 +393,96 @@ class TraceProcessorPoolTest(unittest.TestCase):
       pool.acquire(self.cold, cancel_event=cancel_event)
 
 
+class TpdPoolExecutionTest(unittest.TestCase):
+
+  def setUp(self):
+    tmp = tempfile.TemporaryDirectory()
+    self.addCleanup(tmp.cleanup)
+    self.tmp_dir = tmp.name
+    copy_trace(COLD_TRACE, self.tmp_dir, "cold.perfetto-trace")
+    copy_trace(HOT_TRACE, self.tmp_dir, "hot.perfetto-trace")
+
+  def test_tpd_batch_captures_and_restores_cra_snapshots(self):
+    with running_server(
+        trace_dir=self.tmp_dir,
+        use_tpd=True,
+        tpd_profile="batch",
+        max_workers=2) as server:
+      url = base_url(server)
+      status, st0, _ = request(url, "GET", "/tpd/status")
+      self.assertEqual(status, 200)
+      self.assertTrue(st0["enabled"])
+      self.assertEqual(st0["profile"], "batch")
+      self.assertEqual(st0["tracesKnown"], 2)
+
+      # First query parses from Empty -> Hot, captures init.cra, releases to Cold.
+      status, q1, _ = request(
+          url, "POST", "/execute_bigtrace_query", {
+              "perfetto_sql": "SELECT count(1) AS cnt FROM slice;",
+              "limit": 100,
+              "trace_metadata_columns": ["file_name"],
+          })
+      self.assertEqual(status, 200)
+      self.assertEqual(len(q1["rows"]), 2)
+
+      _, st1, _ = request(url, "GET", "/tpd/status")
+      self.assertEqual(st1["emptyToHotCount"], 2)
+      self.assertEqual(st1["craCaptureCount"], 2)
+      self.assertEqual(st1["coldCount"], 2)
+      self.assertGreater(st1["craStoreBytes"], 0)
+
+      # Second query restores from Cold -> Hot via init.cra snapshot.
+      status, q2, _ = request(
+          url, "POST", "/execute_bigtrace_query", {
+              "perfetto_sql": "SELECT count(1) AS cnt FROM slice;",
+              "limit": 100,
+              "trace_metadata_columns": ["file_name"],
+          })
+      self.assertEqual(status, 200)
+      self.assertEqual(len(q2["rows"]), 2)
+
+      _, st2, _ = request(url, "GET", "/tpd/status")
+      self.assertEqual(st2["coldToHotCount"], 2)
+      self.assertEqual(st2["craRestoreCount"], 2)
+
+  def test_tpd_interactive_replays_session_sql_and_resets(self):
+    with running_server(
+        trace_dir=self.tmp_dir,
+        use_tpd=True,
+        tpd_profile="interactive",
+        keep_alive=True,
+        pool_size=1,
+        max_workers=1) as server:
+      url = base_url(server)
+      # Create a table across both traces; with alive_cap=1, one gets evicted.
+      status, q1, _ = request(
+          url, "POST", "/execute_bigtrace_query", {
+              "perfetto_sql":
+                  "CREATE PERFETTO TABLE t_cnt AS SELECT count(1) AS c FROM slice;"
+                  " SELECT c FROM t_cnt;",
+              "limit": 100,
+          })
+      self.assertEqual(status, 200)
+      self.assertEqual(len(q1["rows"]), 2)
+
+      # Query the created table; the evicted trace restores from CRA + replays qlog.
+      status, q2, _ = request(url, "POST", "/execute_bigtrace_query", {
+          "perfetto_sql": "SELECT c FROM t_cnt;",
+          "limit": 100,
+      })
+      self.assertEqual(status, 200)
+      self.assertEqual(len(q2["rows"]), 2)
+
+      # Reset session clears the replay log and evicts Hot TPs to Cold.
+      status, rst, _ = request(url, "POST", "/tpd/reset_session", {})
+      self.assertEqual(status, 200)
+      self.assertEqual(rst["status"]["hotCount"], 0)
+
+      # Switch profile dynamically via /tpd/config.
+      status, cfg, _ = request(url, "POST", "/tpd/config", {"profile": "batch"})
+      self.assertEqual(status, 200)
+      self.assertEqual(cfg["profile"], "batch")
+
+
 if __name__ == "__main__":
   unittest.main()

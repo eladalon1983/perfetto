@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# tpd — launch tpd_server, tpd_flow, or a test binary under a delegated
+# cgroup-v2 scope
+# so the kernel enforces --memory-budget-mb, --daemon-memory-reserve-mb,
+# --per-trace-mb, and optional --swap-budget-mb. Every argument is forwarded
+# to tpd_server unchanged.
+#
+# Usage:
+#   tpd --traces-dir=/data/traces                  \
+#       --session-dir=/var/lib/tpd                 \
+#       --listen=/var/run/tpd.sock                 \
+#       --tp-binary=/usr/bin/trace_processor_shell \
+#       --profile=batch                            \
+#       --memory-budget-mb=4096                    \
+#       --disk-budget-mb=16384
+#
+#   # Also collect a host Perfetto trace while the daemon runs.
+#   tpd --system-trace=/tmp/tpd-host.pftrace --traces-dir=/data ...
+#
+#   # Snapshots are always on by default; no extra mode flag is needed.
+#
+# Equivalent to:
+#   systemd-run --user --scope -p Delegate=memory --quiet -- \
+#       tpd_server "$@"
+#
+# Why this script: 'systemd-run --user --scope -p Delegate=memory --
+# tpd_server ...' is the production-recommended invocation but it is
+# a mouthful. This script bundles the wrapper, picks a sibling
+# tpd_server next to itself by default, and validates the launch
+# environment so failures point at the cause rather than at a cgroup
+# error several seconds later.
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<EOF
+tpd — wrap tpd_server in a delegated cgroup-v2 scope.
+
+Usage:
+  $(basename "$0") [--tpd-server PATH] -- TPD_SERVER_FLAGS...
+  $(basename "$0") --flow [--tpd-flow PATH] -- TPD_FLOW_COMMAND_AND_FLAGS...
+  $(basename "$0") --run PATH -- ARGS...
+  $(basename "$0") TPD_SERVER_FLAGS...
+
+The script forwards everything after '--' (or all args if no '--') to
+tpd_server inside a 'systemd-run --user --scope -p Delegate=memory' wrapper.
+With --flow, it forwards to tpd_flow instead. This is useful when the whole
+producer/consumer orchestrator should live in the delegated scope; tpd_flow can
+still launch tpd_server stages via this same wrapper.
+
+Pre-flight checks:
+  * systemd-run on PATH
+  * /sys/fs/cgroup/cgroup.controllers contains 'memory'
+  * tpd_server binary located at \$TPD_SERVER (env), or alongside
+    this script, or on PATH
+  * for --flow: tpd_flow binary located at \$TPD_FLOW (env), or alongside
+    this script, or on PATH
+  * for --run: PATH exists and is executable
+
+Examples:
+  $(basename "$0") --traces-dir=/data \\
+                   --profile=batch \\
+                   --memory-budget-mb=4096 --disk-budget-mb=16384
+  $(basename "$0") --flow -- pipeline \\
+                   --tp-binary=/opt/perfetto/trace_processor_shell \\
+                   --traces-dir=/data --work-dir=/var/lib/tpd/flow
+  # Snapshots live under <session-dir>/cra by default. Override with
+  # --snapshot-dir if you need a separate durable volume.
+
+  TPD_SERVER=/opt/tpd/bin/tpd_server $(basename "$0") --listen=/run/tpd.sock ...
+
+Wrapper-only tracing flags:
+  --flow                       Launch tpd_flow instead of tpd_server.
+  --tpd-flow PATH              tpd_flow binary for --flow.
+  --run PATH                   Launch an arbitrary executable in the delegated
+                               scope. Intended for tests only; production
+                               server/flow launches should use the normal modes.
+  --system-trace FILE          Run capture_host_trace.sh beside tpd and
+                               write the host Perfetto trace to FILE. This will
+                               prompt for sudo because ftrace needs root.
+                               tpd_server also emits scoped phase slices into
+                               the same traced session via Track Event.
+  --perfetto-dir DIR           Directory containing perfetto binaries for
+                               --system-trace.
+  --system-trace-buffer-mb N   Default 1024.
+  --system-trace-ftrace-buffer-kb N
+                               Default 131072.
+  --system-trace-write-period-ms N
+                               Default 5000.
+  --system-trace-sys-poll-ms N Default 250.
+  --system-trace-proc-poll-ms N
+                               Default 250.
+  --system-trace-finalize-grace-ms N
+                               Wait after tpd_server exits before stopping
+                               the host trace. Default 2000.
+  --system-trace-no-start-daemons
+                               Do not best-effort start traced/traced_probes.
+EOF
+  exit 1
+}
+
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TPD_SERVER="${TPD_SERVER:-}"
+TPD_FLOW="${TPD_FLOW:-}"
+launch_flow=0
+run_target=""
+
+# Allow '--' to separate our flags from tpd_server's, but accept
+# bare passthrough too.
+system_trace_out=""
+system_trace_perfetto_dir=""
+system_trace_buffer_mb=1024
+system_trace_ftrace_buffer_kb=262144
+system_trace_write_period_ms=5000
+system_trace_sys_poll_ms=250
+system_trace_proc_poll_ms=250
+system_trace_finalize_grace_ms=2000
+system_trace_start_daemons=1
+
+forward=()
+while (($#)); do
+  case "$1" in
+    --tpd-server)
+      [[ $# -ge 2 ]] || { echo "tpd: --tpd-server needs a value" >&2; exit 2; }
+      TPD_SERVER="$2"; shift 2 ;;
+    --tpd-server=*)
+      TPD_SERVER="${1#*=}"; shift ;;
+    --flow)
+      launch_flow=1; shift ;;
+    --run)
+      [[ $# -ge 2 ]] || { echo "tpd: --run needs a value" >&2; exit 2; }
+      run_target="$2"; shift 2 ;;
+    --run=*)
+      run_target="${1#*=}"; shift ;;
+    --tpd-flow)
+      [[ $# -ge 2 ]] || { echo "tpd: --tpd-flow needs a value" >&2; exit 2; }
+      TPD_FLOW="$2"; launch_flow=1; shift 2 ;;
+    --tpd-flow=*)
+      TPD_FLOW="${1#*=}"; launch_flow=1; shift ;;
+    --system-trace)
+      [[ $# -ge 2 ]] || { echo "tpd: --system-trace needs a value" >&2; exit 2; }
+      system_trace_out="$2"; shift 2 ;;
+    --system-trace=*)
+      system_trace_out="${1#*=}"; shift ;;
+    --perfetto-dir)
+      [[ $# -ge 2 ]] || { echo "tpd: --perfetto-dir needs a value" >&2; exit 2; }
+      system_trace_perfetto_dir="$2"; shift 2 ;;
+    --perfetto-dir=*)
+      system_trace_perfetto_dir="${1#*=}"; shift ;;
+    --system-trace-buffer-mb)
+      [[ $# -ge 2 ]] || { echo "tpd: --system-trace-buffer-mb needs a value" >&2; exit 2; }
+      system_trace_buffer_mb="$2"; shift 2 ;;
+    --system-trace-buffer-mb=*)
+      system_trace_buffer_mb="${1#*=}"; shift ;;
+    --system-trace-ftrace-buffer-kb)
+      [[ $# -ge 2 ]] || { echo "tpd: --system-trace-ftrace-buffer-kb needs a value" >&2; exit 2; }
+      system_trace_ftrace_buffer_kb="$2"; shift 2 ;;
+    --system-trace-ftrace-buffer-kb=*)
+      system_trace_ftrace_buffer_kb="${1#*=}"; shift ;;
+    --system-trace-write-period-ms)
+      [[ $# -ge 2 ]] || { echo "tpd: --system-trace-write-period-ms needs a value" >&2; exit 2; }
+      system_trace_write_period_ms="$2"; shift 2 ;;
+    --system-trace-write-period-ms=*)
+      system_trace_write_period_ms="${1#*=}"; shift ;;
+    --system-trace-sys-poll-ms)
+      [[ $# -ge 2 ]] || { echo "tpd: --system-trace-sys-poll-ms needs a value" >&2; exit 2; }
+      system_trace_sys_poll_ms="$2"; shift 2 ;;
+    --system-trace-sys-poll-ms=*)
+      system_trace_sys_poll_ms="${1#*=}"; shift ;;
+    --system-trace-proc-poll-ms)
+      [[ $# -ge 2 ]] || { echo "tpd: --system-trace-proc-poll-ms needs a value" >&2; exit 2; }
+      system_trace_proc_poll_ms="$2"; shift 2 ;;
+    --system-trace-proc-poll-ms=*)
+      system_trace_proc_poll_ms="${1#*=}"; shift ;;
+    --system-trace-finalize-grace-ms)
+      [[ $# -ge 2 ]] || { echo "tpd: --system-trace-finalize-grace-ms needs a value" >&2; exit 2; }
+      system_trace_finalize_grace_ms="$2"; shift 2 ;;
+    --system-trace-finalize-grace-ms=*)
+      system_trace_finalize_grace_ms="${1#*=}"; shift ;;
+    --system-trace-no-start-daemons)
+      system_trace_start_daemons=0; shift ;;
+    --)
+      shift
+      forward+=("$@")
+      break ;;
+    -h|--help)
+      usage ;;
+    *)
+      forward+=("$1"); shift ;;
+  esac
+done
+set -- "${forward[@]}"
+if [[ $# -eq 0 && -z "$run_target" ]]; then usage; fi
+
+pick_tpd_server() {
+  if [[ -n "$TPD_SERVER" ]]; then return 0; fi
+  if [[ -x "$here/tpd_server" ]]; then
+    TPD_SERVER="$here/tpd_server"
+  elif [[ -x "$here/../build/tpd_server" ]]; then
+    TPD_SERVER="$here/../build/tpd_server"
+  elif command -v tpd_server >/dev/null 2>&1; then
+    TPD_SERVER="$(command -v tpd_server)"
+  else
+    echo "tpd: tpd_server not found (checked \$TPD_SERVER, $here, $here/../build, PATH)" >&2
+    exit 2
+  fi
+}
+
+pick_tpd_flow() {
+  if [[ -n "$TPD_FLOW" ]]; then return 0; fi
+  if [[ -x "$here/tpd_flow" ]]; then
+    TPD_FLOW="$here/tpd_flow"
+  elif [[ -x "$here/../tpd_flow" ]]; then
+    TPD_FLOW="$here/../tpd_flow"
+  elif [[ -x "$here/../build/tpd_flow" ]]; then
+    TPD_FLOW="$here/../build/tpd_flow"
+  elif command -v tpd_flow >/dev/null 2>&1; then
+    TPD_FLOW="$(command -v tpd_flow)"
+  else
+    echo "tpd: tpd_flow not found (checked \$TPD_FLOW, $here, $here/.., $here/../build, PATH)" >&2
+    exit 2
+  fi
+}
+
+# Pick the target binary after parsing wrapper-only flags, so `--help`,
+# `--tpd-server PATH`, and `--tpd-flow PATH` work from source checkouts and
+# release archives.
+if [[ -n "$run_target" ]]; then
+  TPD_TARGET="$run_target"
+  [[ -x "$TPD_TARGET" ]] || { echo "tpd: $TPD_TARGET not executable" >&2; exit 2; }
+elif [[ "$launch_flow" -eq 1 ]]; then
+  pick_tpd_flow
+  [[ -x "$TPD_FLOW" ]] || { echo "tpd: $TPD_FLOW not executable" >&2; exit 2; }
+  TPD_TARGET="$TPD_FLOW"
+else
+  pick_tpd_server
+  [[ -x "$TPD_SERVER" ]] || { echo "tpd: $TPD_SERVER not executable" >&2; exit 2; }
+  TPD_TARGET="$TPD_SERVER"
+fi
+TPD_LIB_DIR="${TPD_LIB_DIR:-$here/lib}"
+if [[ -d "$TPD_LIB_DIR" ]]; then
+  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    TPD_LD_LIBRARY_PATH="$TPD_LIB_DIR:$LD_LIBRARY_PATH"
+  else
+    TPD_LD_LIBRARY_PATH="$TPD_LIB_DIR"
+  fi
+else
+  TPD_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+fi
+
+# Pre-flight checks. We announce each one before running it so
+# operators understand exactly what the wrapper is verifying — and
+# any failure points at the precise file / sysctl that's wrong.
+echo "tpd: pre-flight checks"
+
+# 1. systemd-run on PATH (needed for the cgroup-v2 delegation wrap).
+echo -n "  [1/2] command -v systemd-run ... "
+if ! command -v systemd-run >/dev/null 2>&1; then
+  echo "FAIL"
+  echo "    systemd-run not found on PATH; this script needs systemd >= 232" >&2
+  echo "    (Delegate= support). Running tpd_server directly is degraded:" >&2
+  echo "    memory budgets are not kernel-enforced without delegation." >&2
+  exit 3
+fi
+echo "ok ($(command -v systemd-run))"
+
+# 2. Cgroup-v2 unified hierarchy + 'memory' controller available.
+echo -n "  [2/2] grep -w memory /sys/fs/cgroup/cgroup.controllers ... "
+if [[ ! -f /sys/fs/cgroup/cgroup.controllers ]]; then
+  echo "FAIL"
+  echo "    /sys/fs/cgroup/cgroup.controllers absent — host is on legacy" >&2
+  echo "    cgroup v1 or has no cgroup-fs mounted. Fix: boot with" >&2
+  echo "    systemd.unified_cgroup_hierarchy=1, or use a cgroup-v2-only" >&2
+  echo "    distro (Debian >=11, Ubuntu >=21.10, Fedora >=31, RHEL >=9)." >&2
+  exit 4
+fi
+if ! grep -qw memory /sys/fs/cgroup/cgroup.controllers; then
+  echo "FAIL"
+  echo "    'memory' absent from cgroup.controllers." >&2
+  echo "    Available controllers: $(cat /sys/fs/cgroup/cgroup.controllers)" >&2
+  echo "    Fix: enable memory cgroup at boot." >&2
+  exit 5
+fi
+echo "ok ($(cat /sys/fs/cgroup/cgroup.controllers))"
+
+run_tpd() {
+  if [[ -n "$TPD_LD_LIBRARY_PATH" ]]; then
+    systemd-run --user --scope -p Delegate=memory --quiet -- \
+      env LD_LIBRARY_PATH="$TPD_LD_LIBRARY_PATH" "$TPD_TARGET" "$@"
+  else
+    systemd-run --user --scope -p Delegate=memory --quiet -- "$TPD_TARGET" "$@"
+  fi
+}
+
+if [[ -z "$system_trace_out" ]]; then
+  # Forward everything to tpd_server inside a delegated scope. --quiet silences
+  # systemd-run's own banner; tpd_server's own startup output still goes to
+  # stderr unchanged.
+  if [[ -n "$TPD_LD_LIBRARY_PATH" ]]; then
+    exec systemd-run --user --scope -p Delegate=memory --quiet -- \
+      env LD_LIBRARY_PATH="$TPD_LD_LIBRARY_PATH" "$TPD_TARGET" "$@"
+  else
+    exec systemd-run --user --scope -p Delegate=memory --quiet -- "$TPD_TARGET" "$@"
+  fi
+fi
+
+capture_script="$here/capture_host_trace.sh"
+[[ -x "$capture_script" ]] || {
+  echo "tpd: --system-trace requested but $capture_script is missing" >&2
+  exit 6
+}
+
+capture_args=(--out "$system_trace_out"
+              --duration-ms 86400000
+              --buffer-mb "$system_trace_buffer_mb"
+              --ftrace-buffer-kb "$system_trace_ftrace_buffer_kb"
+              --write-period-ms "$system_trace_write_period_ms"
+              --sys-poll-ms "$system_trace_sys_poll_ms"
+              --proc-poll-ms "$system_trace_proc_poll_ms"
+              --no-verify)
+if [[ -n "$system_trace_perfetto_dir" ]]; then
+  capture_args+=(--perfetto-dir "$system_trace_perfetto_dir")
+fi
+if [[ "$system_trace_start_daemons" -eq 0 ]]; then
+  capture_args+=(--no-start-daemons)
+fi
+
+capture_stop_file="$(mktemp -u "/tmp/tpd-system-trace-stop.$$.XXXXXX")"
+capture_ready_fifo="$(mktemp -u "/tmp/tpd-system-trace-ready.$$.XXXXXX")"
+mkfifo "$capture_ready_fifo"
+if [[ "$system_trace_start_daemons" -eq 1 ]] && command -v sudo >/dev/null 2>&1; then
+  echo "tpd: refreshing sudo credentials for --system-trace"
+  if [[ -t 0 ]]; then
+    sudo -v
+  else
+    sudo -n -v || {
+      echo "tpd: sudo credentials are not cached; run 'sudo -v' first or use an interactive terminal" >&2
+      exit 7
+    }
+  fi
+fi
+
+env \
+  "TPD_TRACE_OWNER_UID=$(id -u)" \
+  "TPD_TRACE_OWNER_GID=$(id -g)" \
+  "TPD_TRACE_STOP_FILE=$capture_stop_file" \
+  "TPD_TRACE_READY_FIFO=$capture_ready_fifo" \
+  "$capture_script" "${capture_args[@]}" &
+capture_pid=$!
+capture_stopped=0
+capture_rc=0
+
+stop_capture() {
+  if [[ "$capture_stopped" -eq 1 ]]; then
+    return 0
+  fi
+  capture_stopped=1
+  if kill -0 "$capture_pid" >/dev/null 2>&1; then
+    : > "$capture_stop_file" 2>/dev/null || true
+    mapfile -t capture_descendants < <(
+      descendants_of() {
+        local pid="$1" child
+        pgrep -P "$pid" 2>/dev/null | while read -r child; do
+          descendants_of "$child"
+          printf '%s\n' "$child"
+        done
+      }
+      descendants_of "$capture_pid"
+    )
+    if [[ "${#capture_descendants[@]}" -gt 0 ]]; then
+      sudo -n kill -INT "${capture_descendants[@]}" >/dev/null 2>&1 || true
+    fi
+    kill -INT "$capture_pid" >/dev/null 2>&1 ||
+      sudo -n kill -INT "$capture_pid" >/dev/null 2>&1 || true
+    wait "$capture_pid"
+    capture_rc=$?
+  else
+    wait "$capture_pid"
+    capture_rc=$?
+  fi
+  rm -f "$capture_stop_file" 2>/dev/null || true
+  rm -f "$capture_ready_fifo" 2>/dev/null || true
+}
+trap stop_capture EXIT INT TERM
+
+echo "tpd: system trace running as pid $capture_pid -> $system_trace_out"
+ready_byte="$(mktemp "/tmp/tpd-system-trace-ready-byte.$$.XXXXXX")"
+if ! timeout 30 dd if="$capture_ready_fifo" of="$ready_byte" bs=1 count=1 \
+    status=none; then
+  rm -f "$ready_byte"
+  stop_capture
+  echo "tpd: system trace did not report data-source readiness within 30s" >&2
+  exit 7
+fi
+rm -f "$ready_byte"
+if ! kill -0 "$capture_pid" >/dev/null 2>&1; then
+  wait "$capture_pid"
+  capture_rc=$?
+  capture_stopped=1
+  echo "tpd: system trace failed to start (capture exit=$capture_rc)" >&2
+  exit "$capture_rc"
+fi
+
+set +e
+if [[ "$launch_flow" -eq 1 ]]; then
+  run_tpd "$@"
+else
+  run_tpd --self-trace-system "$@"
+fi
+tpd_rc=$?
+set -e
+if [[ "$system_trace_finalize_grace_ms" =~ ^[0-9]+$ ]] &&
+   [[ "$system_trace_finalize_grace_ms" -gt 0 ]]; then
+  sleep "$(awk "BEGIN { printf \"%.3f\", $system_trace_finalize_grace_ms / 1000 }")"
+fi
+stop_capture
+if [[ "$capture_rc" -ne 0 ]]; then
+  echo "tpd: system trace ended with capture exit=$capture_rc" >&2
+  if [[ "$tpd_rc" -eq 0 ]]; then
+    exit "$capture_rc"
+  fi
+fi
+exit "$tpd_rc"

@@ -142,6 +142,15 @@
   }
 }
 
+.pf-bt-tpd-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--pf-color-border-secondary);
+}
+
 // ---------- Launcher: start a query / Settings of an existing one ----------
 
 // Fills the tab. One page for both jobs — start a query, or an existing

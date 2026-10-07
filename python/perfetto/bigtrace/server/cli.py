@@ -79,6 +79,47 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
       default=DEFAULT_UI_ORIGIN,
       help="Perfetto UI that trace links open in (default: %(default)s)")
 
+  tpd_group = parser.add_argument_group("tpd daemon pool")
+  tpd_group.add_argument(
+      "--tpd",
+      dest="use_tpd",
+      action="store_true",
+      default=True,
+      help="Use the tpd checkpoint/restore daemon pool (default: enabled)")
+  tpd_group.add_argument(
+      "--no-tpd",
+      dest="use_tpd",
+      action="store_false",
+      help="Disable tpd and use the in-process Python TraceProcessor pool")
+  tpd_group.add_argument(
+      "--tpd-profile",
+      choices=["batch", "interactive"],
+      default="batch",
+      help="tpd pool profile: 'batch' for high-throughput sweeps or "
+      "'interactive' for stateful exploration (default: %(default)s)")
+  tpd_group.add_argument(
+      "--tpd-memory-budget-mb",
+      type=int,
+      default=0,
+      metavar="MB",
+      help="tpd memory budget in MiB (default: half of available RAM)")
+  tpd_group.add_argument(
+      "--tpd-disk-budget-mb",
+      type=int,
+      default=-1,
+      metavar="MB",
+      help="tpd CRA snapshot disk budget in MiB (default: half of free disk)")
+  tpd_group.add_argument(
+      "--tpd-session-dir",
+      metavar="DIR",
+      help="Directory for tpd CRA snapshots and logs")
+  tpd_group.add_argument(
+      "--tpd-listen",
+      metavar="SOCK",
+      help="Connect to or bind tpd control socket at SOCK")
+  tpd_group.add_argument(
+      "--tpd-bin", metavar="PATH", help="Path to tpd_server binary")
+
   manifest = parser.add_argument_group("manifest generation")
   manifest.add_argument(
       "--generate-manifest",
@@ -119,6 +160,13 @@ def main(argv: Optional[List[str]] = None) -> None:
           history_db=args.history_db,
           keep_alive=args.keep_alive,
           pool_size=args.pool_size,
+          use_tpd=args.use_tpd,
+          tpd_bin_path=args.tpd_bin,
+          tpd_listen_path=args.tpd_listen,
+          tpd_session_dir=args.tpd_session_dir,
+          tpd_profile="interactive" if args.keep_alive else args.tpd_profile,
+          tpd_memory_budget_mb=args.tpd_memory_budget_mb,
+          tpd_disk_budget_mb=args.tpd_disk_budget_mb,
           cors_origins=tuple(args.cors_origin),
           ui_origin=args.origin,
       ))
@@ -136,10 +184,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         force=args.force,
     )
     catalog.reload(manifest_path=out)
+    if server.executor.tpd_pool is not None:
+      server.executor.tpd_pool.sync_catalog(catalog.get_traces())
 
   url = f"http://{args.host}:{server.server_port}"
   source = catalog.manifest_path or catalog.trace_dir
-  mode = " (keep-alive)" if args.keep_alive else ""
+  if server.executor.tpd_pool is not None:
+    mode = f" (tpd:{server.executor.tpd_pool.profile})"
+  else:
+    mode = " (keep-alive)" if args.keep_alive else ""
   print(
       f"Bigtrace server on {url}\n"
       f"  Traces:  {len(catalog.get_traces())} from {source}\n"

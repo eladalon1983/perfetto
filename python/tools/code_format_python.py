@@ -31,8 +31,8 @@ IGNORE_PATHS = [
 def is_python_exec_script(file):
   if not os.path.isfile(file):
     return False
-  with open(file, 'r') as f:
-    return f.readline().startswith('#!/usr/bin/env python')
+  with open(file, 'rb') as f:
+    return f.readline().startswith(b'#!/usr/bin/env python')
 
 
 class Yapf(CodeFormatterBase):

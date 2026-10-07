@@ -48,6 +48,15 @@ from perfetto.bigtrace.server.trace_processor_pool import (
     KeepAliveTraceProcessorPool,
     TraceProcessorPool,
 )
+from perfetto.bigtrace.server.tpd_client import (
+    FOOTER_STATUS_CANCELLED,
+    FOOTER_STATUS_OK,
+    FOOTER_STATUS_TRUNCATED,
+    TpdError,
+    TpdPoolManager,
+    _iter_framed_fd,
+    decode_result_envelope,
+)
 from perfetto.bigtrace.server.util import (
     as_int,
     get_param,
@@ -86,11 +95,13 @@ class BigtraceQueryExecutor:
       keep_alive: bool = False,
       pool_size: int = 50,
       cache_size: int = 16,
+      tpd_pool: Optional[TpdPoolManager] = None,
   ):
     self.catalog = catalog
     self.history_db = history_db or BigtraceHistoryDb()
     self.cache_size = cache_size
     self.max_workers = max_workers
+    self.tpd_pool = tpd_pool
     tp_config = tp_config or TraceProcessorConfig()
     if keep_alive:
       self.pool: TraceProcessorPool = KeepAliveTraceProcessorPool(
@@ -112,6 +123,8 @@ class BigtraceQueryExecutor:
     # Let stopped queries record their final state before the database closes.
     for run in runs:
       run.join(timeout=10)
+    if self.tpd_pool is not None:
+      self.tpd_pool.close()
     self.pool.close()
     self.history_db.close()
 
@@ -174,9 +187,15 @@ class BigtraceQueryExecutor:
       cancel = ex.get("_cancel")
       if cancel:
         cancel.set()
+      tpd_qid = ex.pop("_tpd_qid", None)
       active = list(ex.get("_active", ()))
       if "_active" in ex:
         ex["_active"].clear()
+    if tpd_qid is not None and self.tpd_pool is not None:
+      try:
+        self.tpd_pool.client.cancel_query(tpd_qid, kill_tps=True)
+      except (OSError, EOFError, TpdError):
+        pass
     for tp in active:
       tp.close()
 
@@ -213,7 +232,11 @@ class BigtraceQueryExecutor:
         get_param(params, "experiment_filter"))
 
     overrides = SettingsOverrides.parse(settings)
-    self.catalog.apply_overrides(overrides)
+    if not self.catalog.is_configured_with(
+        overrides.trace_dir, overrides.recursive, overrides.manifest_path):
+      self.catalog.apply_overrides(overrides)
+      if self.tpd_pool is not None:
+        self.tpd_pool.sync_catalog(self.catalog.get_traces())
     traces, _ = self.catalog.filter_and_sort(
         filters=trace_filters,
         order_by=trace_order_by,
@@ -342,6 +365,10 @@ class BigtraceQueryExecutor:
 
   def _run(self, ex: Dict[str, Any], traces: List[TraceEntry]) -> None:
     """Runs the query on every trace, appending rows to ex as they arrive."""
+    if self.tpd_pool is not None:
+      self._run_tpd(ex, traces)
+      return
+
     limit, cancel = ex["limit"], ex["_cancel"]
     catalog_types = {c["name"]: c["type"] for c in self.catalog.get_schema()}
     rows: List[List[Any]] = ex["_rows"]
@@ -411,6 +438,131 @@ class BigtraceQueryExecutor:
           break
 
         submit_next()
+
+    with self._lock:
+      if ex["status"] != "CANCELLED":
+        if errors and succeeded == 0:
+          ex["status"] = "FAILED"
+          ex["errorMessage"] = "; ".join(errors[:3])
+        else:
+          ex["status"] = "SUCCESS"
+      ex["endTime"] = iso_now()
+    self.history_db.save_execution(ex)
+    if ex["status"] != "CANCELLED":
+      self.history_db.save_results(ex["queryUuid"], rows)
+    self._remember(ex)
+
+  def _run_tpd(self, ex: Dict[str, Any], traces: List[TraceEntry]) -> None:
+    """Streams query results from tpd_server over a pipe fd."""
+    assert self.tpd_pool is not None
+    limit, cancel = ex["limit"], ex["_cancel"]
+    catalog_types = {c["name"]: c["type"] for c in self.catalog.get_schema()}
+    rows: List[List[Any]] = ex["_rows"]
+    sql_columns: Optional[List[str]] = None
+    meta_columns: List[str] = []
+    errors: List[str] = []
+    succeeded = 0
+
+    valid_traces: List[TraceEntry] = []
+    by_tpd_uuid: Dict[str, TraceEntry] = {}
+    by_path: Dict[str, TraceEntry] = {}
+    skipped = 0
+    for t in traces:
+      if t.file_size <= 0 or not os.path.isfile(t.file_path):
+        skipped += 1
+        continue
+      tuuid = self.tpd_pool.tpd_uuid_for(t.trace_uuid, t.file_path)
+      valid_traces.append(t)
+      by_tpd_uuid[tuuid] = t
+      by_path[os.path.abspath(t.file_path)] = t
+      by_path[os.path.realpath(t.file_path)] = t
+
+    if skipped:
+      with self._lock:
+        ex["processedTraces"] += skipped
+
+    if valid_traces and not cancel.is_set():
+      target_uuids = [
+          self.tpd_pool.tpd_uuid_for(t.trace_uuid, t.file_path)
+          for t in valid_traces
+      ]
+      r_fd = -1
+      try:
+        qid, dispatched, _, r_fd = self.tpd_pool.client.start_query(
+            sql=ex["perfettoSql"],
+            trace_uuids=target_uuids,
+            max_rows=limit,
+        )
+        with self._lock:
+          ex["_tpd_qid"] = qid
+          if dispatched < len(valid_traces):
+            ex["processedTraces"] += len(valid_traces) - dispatched
+          if cancel.is_set():
+            self.tpd_pool.client.cancel_query(qid, kill_tps=True)
+
+        footers_seen = 0
+        for raw_frame in _iter_framed_fd(r_fd):
+          if cancel.is_set():
+            break
+          env = decode_result_envelope(raw_frame)
+          trace = (
+              by_tpd_uuid.get(env.trace_uuid) or by_path.get(env.trace_path))
+          if env.raw_query_result is not None and trace is not None:
+            try:
+              cols, batches = query_result.decode_bytes(env.raw_query_result)
+              trace_rows: List[List[Any]] = []
+              for decode in batches:
+                if not self._wants_rows(ex):
+                  break
+                batch = decode()
+                trace_rows.extend(batch[:self._claim_rows(ex, len(batch))])
+            except TraceProcessorException as e:
+              errors.append(f"{trace.file_name}: {e}")
+              continue
+
+            with self._lock:
+              if sql_columns is None:
+                sql_columns = cols
+                meta_columns = [c for c in catalog_types if c not in cols]
+                ex["_columns"] = sql_columns + meta_columns
+                ex["_schema_map"] = {c: catalog_types[c] for c in meta_columns}
+              if cols == sql_columns:
+                meta = [trace.get_value(c) for c in meta_columns]
+                rows.extend(r + meta for r in trace_rows[:limit - len(rows)])
+                ex["processedRows"] = len(rows)
+                self._update_schema(ex, sql_columns, trace_rows)
+              else:
+                errors.append(f"{trace.file_name}: returned different columns")
+          elif env.footer is not None:
+            footers_seen += 1
+            st = env.footer.status
+            with self._lock:
+              ex["processedTraces"] += 1
+              if st in (FOOTER_STATUS_OK, FOOTER_STATUS_TRUNCATED):
+                succeeded += 1
+              elif st != FOOTER_STATUS_CANCELLED and not cancel.is_set():
+                name = trace.file_name if trace else (env.trace_uuid or "trace")
+                msg = env.footer.error_message or f"status={st}"
+                errors.append(f"{name}: {msg}")
+          elif env.complete is not None:
+            with self._lock:
+              remaining = max(0, dispatched - footers_seen)
+              ex["processedTraces"] += remaining
+              if env.complete.traces_ok > succeeded:
+                succeeded = env.complete.traces_ok
+            break
+      except Exception as e:  # pylint: disable=broad-except
+        if not cancel.is_set():
+          logger.info("tpd query failed: %s", e)
+          errors.append(str(e))
+      finally:
+        with self._lock:
+          ex.pop("_tpd_qid", None)
+        if r_fd >= 0:
+          try:
+            os.close(r_fd)
+          except OSError:
+            pass
 
     with self._lock:
       if ex["status"] != "CANCELLED":

@@ -60,6 +60,12 @@ def query(tp: TraceProcessor,
   with conn.getresponse() as response:
     data = response.read()
 
+  return decode_bytes(data)
+
+
+def decode_bytes(
+    data: bytes) -> Tuple[List[str], List[Callable[[], List[List[Any]]]]]:
+  """Decodes a raw perfetto.protos.QueryResult message into (columns, batches)."""
   columns: List[str] = []
   batches: List[memoryview] = []
   for field, value in _fields(memoryview(data)):

@@ -31,6 +31,11 @@ from perfetto.bigtrace.server.http_handler import (
     BigtraceHandler,
     DEFAULT_CORS_ORIGINS,
 )
+from perfetto.bigtrace.server.tpd_client import (
+    TpdError,
+    TpdPoolManager,
+    resolve_tpd_server_bin,
+)
 from perfetto.bigtrace.server.util import (
     default_worker_count,
     resolve_trace_processor_bin,
@@ -59,6 +64,14 @@ class BigtraceServerConfig:
   # Keep up to pool_size traces loaded between queries.
   keep_alive: bool = False
   pool_size: int = 50
+  # tpd (Trace Processor Daemon) pool configuration.
+  use_tpd: bool = False
+  tpd_bin_path: Optional[str] = None
+  tpd_listen_path: Optional[str] = None
+  tpd_session_dir: Optional[str] = None
+  tpd_profile: str = "batch"
+  tpd_memory_budget_mb: int = 0
+  tpd_disk_budget_mb: int = -1
   # Origins allowed besides DEFAULT_CORS_ORIGINS and localhost; "*" for any.
   cors_origins: Tuple[str, ...] = ()
   # Perfetto UI that trace links open in; its origin is allowed to fetch traces.
@@ -90,14 +103,36 @@ class BigtraceServer:
         ui_origin=cfg.ui_origin,
     )
     self.history_db = self._open_history_db()
+    tp_bin = resolve_trace_processor_bin(cfg.bin_path)
+    tpd_pool: Optional[TpdPoolManager] = None
+    if cfg.use_tpd and tp_bin:
+      tpd_bin = resolve_tpd_server_bin(cfg.tpd_bin_path)
+      if tpd_bin or cfg.tpd_listen_path:
+        try:
+          tpd_pool = TpdPoolManager(
+              tp_binary_path=tp_bin,
+              tpd_binary_path=tpd_bin,
+              listen_path=cfg.tpd_listen_path,
+              session_dir=cfg.tpd_session_dir,
+              profile=cfg.tpd_profile,
+              memory_budget_mb=cfg.tpd_memory_budget_mb,
+              disk_budget_mb=cfg.tpd_disk_budget_mb,
+              alive_cap=cfg.pool_size if cfg.keep_alive else 0,
+              cpu_workers=cfg.max_workers,
+          )
+          tpd_pool.sync_catalog(self.catalog.get_traces())
+        except (OSError, TpdError) as e:
+          logger.warning(
+              "Failed to start tpd (%s); falling back to Python pool", e)
+          tpd_pool = None
     self.executor = BigtraceQueryExecutor(
         catalog=self.catalog,
-        tp_config=TraceProcessorConfig(
-            bin_path=resolve_trace_processor_bin(cfg.bin_path)),
+        tp_config=TraceProcessorConfig(bin_path=tp_bin),
         max_workers=cfg.max_workers,
         history_db=self.history_db,
         keep_alive=cfg.keep_alive,
         pool_size=cfg.pool_size,
+        tpd_pool=tpd_pool,
     )
     handler.executor = self.executor
     handler.catalog = self.catalog

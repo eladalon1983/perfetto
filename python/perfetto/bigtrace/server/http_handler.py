@@ -160,17 +160,28 @@ class BigtraceHandler(http.server.BaseHTTPRequestHandler):
   # Catalog endpoints -------------------------------------------------------
 
   def _root(self, _body):
-    self._send_json(
-        200, {
-            "status": "ok",
-            "service": "bigtrace",
-            "traceCount": len(self.catalog.get_traces()),
-            "traceDir": self.catalog.trace_dir,
-            "recursive": self.catalog.recursive,
-        })
+    res: Dict[str, Any] = {
+        "status":
+            "ok",
+        "service":
+            "bigtrace",
+        "traceCount":
+            len(self.catalog.get_traces()),
+        "traceDir":
+            self.catalog.trace_dir,
+        "recursive":
+            self.catalog.recursive,
+        "tpd":
+            self.executor.tpd_pool.get_status() if self.executor.tpd_pool else {
+                "enabled": False
+            },
+    }
+    self._send_json(200, res)
 
   def _refresh(self, _body):
     self.catalog.reload()
+    if self.executor.tpd_pool is not None:
+      self.executor.tpd_pool.sync_catalog(self.catalog.get_traces())
     self._send_json(200, {
         "status": "ok",
         "traceCount": len(self.catalog.get_traces())
@@ -340,12 +351,61 @@ class BigtraceHandler(http.server.BaseHTTPRequestHandler):
     table_name = str(body.get("table_name", ""))
     self._send_json(200, self.executor.check_table_exists(table_name))
 
+  # tpd pool endpoints ------------------------------------------------------
+
+  def _tpd_status(self, _body):
+    if self.executor.tpd_pool is None:
+      return self._send_json(200, {"enabled": False})
+    self._send_json(200, self.executor.tpd_pool.get_status())
+
+  def _tpd_traces(self, _body):
+    if self.executor.tpd_pool is None:
+      return self._send_json(200, {"enabled": False, "traces": []})
+    traces = self.executor.tpd_pool.client.list_traces()
+    self._send_json(200, {"enabled": True, "traces": traces})
+
+  def _tpd_config(self, body):
+    pool = self.executor.tpd_pool
+    if pool is None:
+      raise ValueError("tpd pool is not enabled")
+    profile = get_param(body, "profile")
+    if profile:
+      pool.set_profile(str(profile))
+    mem_mb = as_int(get_param(body, "memory_budget_mb"), None)
+    disk_mb = as_int(get_param(body, "disk_budget_mb"), None)
+    alive_cap = as_int(get_param(body, "alive_cap"), None)
+    workers = as_int(get_param(body, "cpu_workers"), None)
+    per_trace_mb = as_int(get_param(body, "per_trace_mb"), None)
+    if any(
+        v is not None
+        for v in (mem_mb, disk_mb, alive_cap, workers, per_trace_mb)):
+      pool.client.update_config(
+          memory_budget_mb=mem_mb,
+          disk_budget_mb=disk_mb,
+          alive_cap=alive_cap,
+          cpu_workers=workers,
+          per_trace_mb=per_trace_mb,
+      )
+    self._send_json(200, pool.get_status())
+
+  def _tpd_reset_session(self, _body):
+    pool = self.executor.tpd_pool
+    if pool is None:
+      raise ValueError("tpd pool is not enabled")
+    res = pool.client.reset_session()
+    res["status"] = pool.get_status()
+    self._send_json(200, res)
+
 
 _UUID = r"([^/:]+)"
 ROUTES = [
     (method, re.compile(pattern), handler) for method, pattern, handler in [
         ("GET", r"/", BigtraceHandler._root),
         ("POST", r"/refresh", BigtraceHandler._refresh),
+        ("GET", r"/tpd/status", BigtraceHandler._tpd_status),
+        ("GET", r"/tpd/traces", BigtraceHandler._tpd_traces),
+        ("POST", r"/tpd/config", BigtraceHandler._tpd_config),
+        ("POST", r"/tpd/reset_session", BigtraceHandler._tpd_reset_session),
         ("GET", r"/trace_presets", BigtraceHandler._presets),
         ("GET", rf"/trace/{_UUID}/[^/]+", BigtraceHandler._trace_file),
         ("GET", r"/query_executions", BigtraceHandler._list_executions),

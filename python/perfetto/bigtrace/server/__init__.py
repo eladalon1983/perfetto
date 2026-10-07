@@ -31,4 +31,10 @@ from perfetto.bigtrace.server.manifest import (BigtraceManifestGenerator,
 from perfetto.bigtrace.server.server import BigtraceServer, BigtraceServerConfig
 from perfetto.bigtrace.server.trace_processor_pool import (
     EphemeralTraceProcessorPool, KeepAliveTraceProcessorPool)
+from perfetto.bigtrace.server.tpd_client import (
+    TpdClient,
+    TpdError,
+    TpdPoolManager,
+    resolve_tpd_server_bin,
+)
 from perfetto.bigtrace.server.util import resolve_trace_processor_bin
